@@ -1163,6 +1163,12 @@ export default class Bot {
                             });
                     },
                     (callback): void => {
+                        if (process.env.STEAM_TRADE_URL) {
+                            this.tradeOfferUrl = process.env.STEAM_TRADE_URL;
+                            /* eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call */
+                            return callback(null);
+                        }
+
                         this.community.getTradeURL((err, url) => {
                             if (err) {
                                 /* eslint-disable-next-line @typescript-eslint/no-unsafe-return, @typescript-eslint/no-unsafe-call */

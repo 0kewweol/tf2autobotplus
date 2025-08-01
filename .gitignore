@@ -85,3 +85,7 @@ dist/
 
 
 .idea/
+
+.github/
+.idea/
+.vscode/
