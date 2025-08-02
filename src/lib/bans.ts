@@ -101,7 +101,11 @@ export default class Bans {
                 isBanned,
                 contents
             };
-        } catch {
+        } catch (err) {
+            log.warn(
+                `Rep.autobot.tf failed for ${this.steamID}, falling back to individual checks:`,
+                (err as Error).message
+            );
             // always deny by default
             let result: IsBanned = {
                 isBanned: true,
@@ -202,8 +206,17 @@ export default class Bans {
                     checkMptf: this.repOpt.checkMptfBanned
                 }
             })
-                .then(body => resolve(body))
-                .catch(err => reject(err));
+                .then(body => {
+                    log.debug(`Rep.autobot.tf result for ${this.steamID}:`, body);
+                    resolve(body);
+                })
+                .catch(err => {
+                    log.warn(`Failed to get data from rep.autobot.tf for ${this.steamID}:`, err.message);
+                    if (err.response?.status === 429) {
+                        log.warn(`Rate limited by rep.autobot.tf for ${this.steamID}`);
+                    }
+                    reject(err);
+                });
         });
     }
 

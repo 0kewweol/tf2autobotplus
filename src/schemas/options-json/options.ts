@@ -494,6 +494,9 @@ export const optionsSchema: jsonschema.Schema = {
                     properties: {
                         checkMptfBanned: {
                             type: 'boolean'
+                        },
+                        skipAdminBanCheck: {
+                            type: 'boolean'
                         }
                     },
                     required: ['checkMptfBanned'],

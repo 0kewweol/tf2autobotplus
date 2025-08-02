@@ -269,32 +269,62 @@ export default class Bot {
     }
 
     private async checkAdminBanned(): Promise<boolean> {
-        // guilty until proven otherwise
-        let banned = true;
-        const check = async (steamid: string) => {
+        // Check if admin ban check is disabled
+        if (this.options.miscSettings.reputationCheck?.skipAdminBanCheck) {
+            log.debug('Admin ban check is disabled in settings, skipping...');
+            return false;
+        }
+
+        const check = async (steamid: string): Promise<boolean> => {
             const v = new Bans({ bot: this, userID: this.userID, steamID: steamid, showLog: 'banned' });
             const result = await v.isBanned();
-            banned = result.isBanned;
+            return result.isBanned;
         };
 
         const steamids = this.admins.map(steamID => steamID.getSteamID64());
         steamids.push(this.client.steamID.getSteamID64());
-        for (const steamid of steamids) {
-            // same as Array.some, but I want to use await
+
+        for (let i = 0; i < steamids.length; i++) {
+            const steamid = steamids[i];
+
+            // Add delay between requests to avoid rate limiting (except for first request)
+            if (i > 0) {
+                log.debug(`Waiting 2 seconds before checking next account to avoid rate limiting...`);
+                await new Promise(resolve => setTimeout(resolve, 2000));
+            }
+
             try {
-                await check(steamid);
+                log.debug(`Checking ban status for ${steamid}...`);
+                const isBanned = await check(steamid);
+                if (isBanned) {
+                    // If any admin or bot account is banned, return true
+                    log.warn(`Account ${steamid} is banned! Stopping bot for safety.`);
+                    return true;
+                } else {
+                    log.debug(`Account ${steamid} is clean.`);
+                }
             } catch (err) {
                 const error = err as AxiosError;
                 if (error?.response?.status === 429) {
+                    log.warn(`Rate limited while checking ${steamid}, retrying in 10 seconds...`);
                     await new Promise(resolve => setTimeout(resolve, 10000));
-                    await check(steamid);
+                    const isBanned = await check(steamid);
+                    if (isBanned) {
+                        log.warn(`Account ${steamid} is banned! Stopping bot for safety.`);
+                        return true;
+                    } else {
+                        log.debug(`Account ${steamid} is clean after retry.`);
+                    }
                 } else {
-                    throw err;
+                    // If we can't check ban status due to error, assume banned for safety
+                    log.warn(`Failed to check ban status for ${steamid}, assuming banned for safety:`, err);
+                    return true;
                 }
             }
         }
 
-        return banned;
+        // If all accounts are clean, return false
+        return false;
     }
 
     private periodicCheck(): void {

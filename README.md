@@ -21,6 +21,10 @@
 
 **Attention! Sometimes the autopricer does not take into account some item attributes, so you need to check and adjust prices manually.**
 
+<div align="left">
+    <img src="./src/assets/alert-autopricer.png" alt="alert" width="400">
+</div>
+
 ### Attention! Experimental features are in the active testing phase and offer no guarantees.
 
 ## Features

@@ -1234,6 +1234,7 @@ interface Prefixes {
 
 export interface ReputationCheck {
     checkMptfBanned?: boolean;
+    skipAdminBanCheck?: boolean;
 }
 
 interface AlwaysRemoveItemAttributes {
