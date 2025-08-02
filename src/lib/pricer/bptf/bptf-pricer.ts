@@ -1,4 +1,4 @@
-import axios from 'axios';
+import axios, { AxiosResponse } from 'axios';
 import Currencies from '@tf2autobot/tf2-currencies';
 import IPricer, {
     GetItemPriceResponse,
@@ -9,7 +9,7 @@ import IPricer, {
 } from '../../../classes/IPricer';
 import SKU = require('@tf2autobot/tf2-sku');
 
-interface BackpackTFPriceEntry {
+interface PriceEntry {
     currency: string;
     value: number;
     value_raw?: number;
@@ -17,43 +17,48 @@ interface BackpackTFPriceEntry {
     last_update?: number;
 }
 
-interface BackpackTFResponse {
+interface ItemData {
+    defindex: number[];
+    prices: Record<string, Record<string, Record<string, PriceEntry[] | Record<string, any>>>>;
+}
+
+interface BptfApiResponse {
     response: {
         success: number;
         current_time: number;
-        items: {
-            [itemName: string]: {
-                defindex: number[];
-                prices: {
-                    [quality: string]: {
-                        [tradable: string]: {
-                            [craftable: string]: {
-                                [killstreak: string]: {
-                                    [strange: string]: {
-                                        [australium: string]: {
-                                            [festive: string]: BackpackTFPriceEntry[];
-                                        };
-                                    };
-                                };
-                            };
-                        };
-                    };
-                };
-            };
-        };
+        items: Record<string, ItemData>;
     };
 }
+
+interface PriceCache {
+    data: BptfApiResponse;
+    timestamp: number;
+    defindexMap: Map<number, string[]>;
+}
+
+interface PriceConfig {
+    keyMargin: number;
+    metalMargin: number;
+    minKeyMargin: number;
+    minMetalMargin: number;
+}
+
+const PRICE_CONFIGS: Record<string, PriceConfig> = {
+    unusual: { keyMargin: 0.02, metalMargin: 0.02, minKeyMargin: 0.5, minMetalMargin: 0.33 },
+    australium: { keyMargin: 0.03, metalMargin: 0.03, minKeyMargin: 0.25, minMetalMargin: 0.22 },
+    killstreak: { keyMargin: 0.03, metalMargin: 0.03, minKeyMargin: 0.1, minMetalMargin: 0.11 },
+    professional: { keyMargin: 0.04, metalMargin: 0.04, minKeyMargin: 0.1, minMetalMargin: 0.11 },
+    default: { keyMargin: 0.0, metalMargin: 0.0, minKeyMargin: 0.05, minMetalMargin: 0.11 }
+};
 
 export default class BackpackTFPricer implements IPricer {
     private readonly apiKey: string;
 
     private readonly baseUrl = 'https://backpack.tf/api/IGetPrices/v4';
 
-    private pricesCache: BackpackTFResponse | null = null;
+    private readonly cacheTimeout = 300000;
 
-    private cacheTime = 0;
-
-    private readonly cacheTimeout = 300000; // 5 минут
+    private cache: PriceCache | null = null;
 
     static getPricer(options?: PricerOptions): IPricer {
         return new BackpackTFPricer(options);
@@ -70,196 +75,127 @@ export default class BackpackTFPricer implements IPricer {
     }
 
     async requestCheck(sku: string): Promise<RequestCheckResponse> {
-        await this.getPrice(sku);
-        return { sku, name: undefined };
+        try {
+            SKU.fromString(sku);
+            return { sku };
+        } catch {
+            return { sku, name: 'Invalid SKU' };
+        }
     }
 
-    private toCurrencies(value: number, currency: string): Currencies {
-        if (currency === 'keys') return new Currencies({ keys: value, metal: 0 });
-        return new Currencies({ keys: 0, metal: value });
-    }
-
-    private calculateSellPrice(
-        buyValue: number,
-        currency: string,
-        valueHigh?: number | null,
-        parsedSKU?: ReturnType<typeof SKU.fromString>
-    ): number {
-        if (valueHigh !== null && valueHigh !== undefined && valueHigh > buyValue) {
-            return valueHigh;
-        }
-
-        if (parsedSKU) {
-            if (parsedSKU.quality === 5) {
-                if (currency === 'keys') {
-                    return buyValue + Math.max(0.5, buyValue * 0.02);
-                } else {
-                    return buyValue + Math.max(0.33, buyValue * 0.02);
-                }
-            }
-
-            if (parsedSKU.australium) {
-                if (currency === 'keys') {
-                    return buyValue + Math.max(0.25, buyValue * 0.03);
-                } else {
-                    return buyValue + Math.max(0.22, buyValue * 0.03);
-                }
-            }
-
-            if (parsedSKU.killstreak && parsedSKU.killstreak > 0) {
-                const ksMultiplier = parsedSKU.killstreak === 3 ? 0.04 : 0.03;
-                if (currency === 'keys') {
-                    return buyValue + Math.max(0.1, buyValue * ksMultiplier);
-                } else {
-                    return buyValue + Math.max(0.11, buyValue * ksMultiplier);
-                }
-            }
-        }
-
-        if (currency === 'metal') {
-            return buyValue + 0.11;
-        } else if (currency === 'keys') {
-            return buyValue + 0.05;
-        }
-
-        return buyValue;
-    }
-
-    private getPriceKeys(parsedSKU: ReturnType<typeof SKU.fromString>): string[] {
-        const killstreakMap: { [key: number]: string } = {
-            0: 'Normal',
-            1: 'Killstreak',
-            2: 'Specialized Killstreak',
-            3: 'Professional Killstreak'
-        };
-
-        const isStrange = parsedSKU.quality2 === 11;
-
-        return [
-            killstreakMap[parsedSKU.killstreak ?? 0] ?? 'Normal',
-            isStrange ? 'Strange' : 'Normal',
-            parsedSKU.australium ? 'Australium' : 'Normal',
-            parsedSKU.festive ? 'Festive' : 'Normal'
-        ];
-    }
-
-    private isItemSupported(parsedSKU: ReturnType<typeof SKU.fromString>): boolean {
-        const unsupportedDefindexes = [
-            
-        ];
-
-        if (unsupportedDefindexes.includes(parsedSKU.defindex)) {
-            return false;
-        }
-
-        if (parsedSKU.quality < 0 || parsedSKU.quality > 15) {
-            return false;
-        }
-
-        return true;
-    }
-
-    private normalizeSKUForSearch(parsedSKU: ReturnType<typeof SKU.fromString>): ReturnType<typeof SKU.fromString> {
-        const normalized = { ...parsedSKU };
-
-        if (normalized.paint && this.shouldIgnorePaint(normalized)) {
-            delete normalized.paint;
-        }
-
-        if (normalized.wear && this.shouldIgnoreWear(normalized)) {
-            delete normalized.wear;
-        }
-
-        return normalized;
-    }
-
-    private shouldIgnorePaint(parsedSKU: ReturnType<typeof SKU.fromString>): boolean {
-        return parsedSKU.quality !== 15;
-    }
-
-    private shouldIgnoreWear(parsedSKU: ReturnType<typeof SKU.fromString>): boolean {
-        return parsedSKU.quality !== 15;
-    }
-
-    private getAlternativeSKUs(parsedSKU: ReturnType<typeof SKU.fromString>): ReturnType<typeof SKU.fromString>[] {
-        const alternatives: ReturnType<typeof SKU.fromString>[] = [];
-
-        if (parsedSKU.killstreak && parsedSKU.killstreak > 0) {
-            alternatives.push({ ...parsedSKU, killstreak: 0 });
-        }
-
-        if (parsedSKU.quality2 === 11) {
-            alternatives.push({ ...parsedSKU, quality2: undefined });
-        }
-
-        if (parsedSKU.festive) {
-            alternatives.push({ ...parsedSKU, festive: false });
-        }
-
-        alternatives.push({
-            ...parsedSKU,
-            killstreak: 0,
-            quality2: undefined,
-            australium: false,
-            festive: false,
-            effect: undefined,
-            paint: undefined,
-            wear: undefined,
-            paintkit: undefined
-        });
-
-        return alternatives;
-    }
-
-    private async fetchPrices(): Promise<BackpackTFResponse> {
+    private async fetchPrices(): Promise<BptfApiResponse> {
         const now = Date.now();
 
-        if (this.pricesCache && now - this.cacheTime < this.cacheTimeout) {
-            return this.pricesCache;
+        if (this.cache && now - this.cache.timestamp < this.cacheTimeout) {
+            return this.cache.data;
         }
 
         try {
-            const res = await axios.get<BackpackTFResponse>(this.baseUrl, {
+            const response: AxiosResponse<BptfApiResponse> = await axios.get(this.baseUrl, {
                 params: { key: this.apiKey, raw: 1 },
-                timeout: 30000
+                timeout: 30000,
+                headers: { 'Accept-Encoding': 'gzip' }
             });
 
-            this.pricesCache = res.data;
-            this.cacheTime = now;
+            const defindexMap = new Map<number, string[]>();
+            for (const [itemName, itemData] of Object.entries(response.data.response.items)) {
+                for (const defindex of itemData.defindex) {
+                    if (!defindexMap.has(defindex)) {
+                        defindexMap.set(defindex, []);
+                    }
+                    defindexMap.get(defindex)!.push(itemName);
+                }
+            }
 
-            return res.data;
+            this.cache = {
+                data: response.data,
+                timestamp: now,
+                defindexMap
+            };
+
+            return response.data;
         } catch (error) {
-            if (this.pricesCache) {
+            if (this.cache) {
                 console.warn('BackpackTF API error, using cached data:', error);
-                return this.pricesCache;
+                return this.cache.data;
             }
             throw error;
         }
     }
 
-    private findPriceInNestedStructure(data: any, keys: string[]): BackpackTFPriceEntry | null {
-        let current = data;
+    private createCurrencies(value: number, currency: string): Currencies {
+        return currency === 'keys'
+            ? new Currencies({ keys: value, metal: 0 })
+            : new Currencies({ keys: 0, metal: value });
+    }
 
-        for (const key of keys) {
-            if (!current || typeof current !== 'object') {
-                return null;
+    private calculateSellPrice(buyValue: number, currency: string, valueHigh: number | null, parsed: any): number {
+        if (valueHigh && valueHigh > buyValue) {
+            return valueHigh;
+        }
+
+        let config: PriceConfig;
+        if (parsed.quality === 5) {
+            config = PRICE_CONFIGS.unusual;
+        } else if (parsed.australium) {
+            config = PRICE_CONFIGS.australium;
+        } else if (parsed.killstreak === 3) {
+            config = PRICE_CONFIGS.professional;
+        } else if (parsed.killstreak > 0) {
+            config = PRICE_CONFIGS.killstreak;
+        } else {
+            config = PRICE_CONFIGS.default;
+        }
+
+        const isKeys = currency === 'keys';
+        const margin = isKeys ? config.keyMargin : config.metalMargin;
+        const minMargin = isKeys ? config.minKeyMargin : config.minMetalMargin;
+
+        return buyValue + Math.max(minMargin, buyValue * margin);
+    }
+
+    private buildPricePath(parsed: any): string[] {
+        const quality = String(parsed.quality || 6);
+        const tradable = parsed.tradable ? 'Tradable' : 'Non-Tradable';
+        const craftable = parsed.craftable ? 'Craftable' : 'Non-Craftable';
+
+        const path = [quality, tradable, craftable];
+
+        if (parsed.killstreak > 0) {
+            const killstreakNames = ['Normal', 'Killstreak', 'Specialized Killstreak', 'Professional Killstreak'];
+            path.push(killstreakNames[parsed.killstreak] || 'Normal');
+        } else {
+            path.push('Normal');
+        }
+
+        path.push(parsed.quality2 === 11 ? 'Strange' : 'Normal');
+        path.push(parsed.australium ? 'Australium' : 'Normal');
+        path.push(parsed.festive ? 'Festive' : 'Normal');
+
+        return path;
+    }
+
+    private findPriceInData(itemData: ItemData, path: string[], effect?: number): PriceEntry | null {
+        let current: any = itemData.prices;
+
+        for (const segment of path) {
+            if (!current?.[segment]) {
+                if (segment !== 'Normal' && current?.['Normal']) {
+                    current = current['Normal'];
+                } else {
+                    return null;
+                }
+            } else {
+                current = current[segment];
             }
+        }
 
-            if (current[key]) {
-                current = current[key];
-                continue;
-            }
-
-            if (key !== 'Normal' && current['Normal']) {
-                current = current['Normal'];
-                continue;
-            }
-
-            return null;
+        if (effect !== undefined && current?.[effect]) {
+            current = current[effect];
         }
 
         if (Array.isArray(current) && current.length > 0) {
-            return current[0];
+            return current[0] as PriceEntry;
         }
 
         return null;
@@ -269,133 +205,44 @@ export default class BackpackTFPricer implements IPricer {
         try {
             const parsed = SKU.fromString(sku);
 
-            if (!this.isItemSupported(parsed)) {
-                return {
-                    sku,
-                    source: 'bptf',
-                    time: Math.floor(Date.now() / 1000),
-                    buy: null,
-                    sell: null,
-                    message: 'Item not supported'
-                };
+            if (parsed.quality < 0 || parsed.quality > 15) {
+                return this.createErrorResponse(sku, 'Invalid quality');
             }
 
             const data = await this.fetchPrices();
-            const items = data.response.items;
 
-            if (parsed.quality === 5 && parsed.effect) {
-                return this.handleUnusualPrice(sku, parsed, data);
+            const itemNames = this.cache?.defindexMap.get(parsed.defindex);
+            if (!itemNames?.length) {
+                return this.createErrorResponse(sku, 'Item not found');
             }
 
-            const normalizedSKU = this.normalizeSKUForSearch(parsed);
+            for (const itemName of itemNames) {
+                const itemData = data.response.items[itemName];
+                if (!itemData) continue;
 
-            const mainResult = await this.searchPriceInItems(sku, normalizedSKU, items);
-            if (mainResult.buy !== null) {
-                return mainResult;
-            }
+                const path = this.buildPricePath(parsed);
+                const priceEntry = this.findPriceInData(itemData, path, parsed.effect);
 
-            const alternatives = this.getAlternativeSKUs(normalizedSKU);
-            for (const altSKU of alternatives) {
-                const altResult = await this.searchPriceInItems(sku, altSKU, items);
-                if (altResult.buy !== null) {
-                    console.warn(`Using alternative SKU for ${sku}`);
-                    return altResult;
+                if (priceEntry) {
+                    return this.createPriceResponse(sku, priceEntry, parsed);
                 }
             }
 
-            return {
-                sku,
-                source: 'bptf',
-                time: Math.floor(Date.now() / 1000),
-                buy: null,
-                sell: null,
-                message: 'Price not found in Backpack.tf data'
-            };
+            return this.createErrorResponse(sku, 'Price not found');
         } catch (error) {
             console.error(`Error getting price for ${sku}:`, error);
-            return {
-                sku,
-                source: 'bptf',
-                time: Math.floor(Date.now() / 1000),
-                buy: null,
-                sell: null,
-                message: `Error: ${error instanceof Error ? error.message : 'Unknown error'}`
-            };
+            return this.createErrorResponse(sku, `Error: ${error instanceof Error ? error.message : 'Unknown error'}`);
         }
     }
 
-    private async searchPriceInItems(
-        originalSKU: string,
-        parsedSKU: ReturnType<typeof SKU.fromString>,
-        items: any
-    ): Promise<GetItemPriceResponse> {
-        for (const name in items) {
-            const item = items[name];
-            const defindexes = item.defindex || [];
-
-            if (!defindexes.includes(Number(parsedSKU.defindex))) continue;
-
-            const qualities = item.prices;
-            const quality = String(parsedSKU.quality || 6);
-            const qualityData = qualities[quality];
-
-            if (!qualityData) continue;
-
-            const tradable = parsedSKU.tradable ? 'Tradable' : 'Non-Tradable';
-            const craftable = parsedSKU.craftable ? 'Craftable' : 'Non-Craftable';
-
-            const baseStructure = qualityData?.[tradable]?.[craftable];
-            if (!baseStructure) continue;
-
-            if (
-                !parsedSKU.killstreak &&
-                parsedSKU.quality2 !== 11 &&
-                !parsedSKU.australium &&
-                !parsedSKU.festive &&
-                !parsedSKU.effect
-            ) {
-                const priceEntry = Array.isArray(baseStructure) ? baseStructure[0] : null;
-                if (priceEntry && typeof priceEntry === 'object' && 'currency' in priceEntry) {
-                    return this.createPriceResponse(originalSKU, priceEntry as BackpackTFPriceEntry, parsedSKU);
-                }
-            }
-
-            const priceKeys = this.getPriceKeys(parsedSKU);
-            const priceEntry = this.findPriceInNestedStructure(baseStructure, priceKeys);
-
-            if (priceEntry) {
-                return this.createPriceResponse(originalSKU, priceEntry, parsedSKU);
-            }
-
-            const fallbackKeys = ['Normal', 'Normal', 'Normal', 'Normal'];
-            const fallbackEntry = this.findPriceInNestedStructure(baseStructure, fallbackKeys);
-
-            if (fallbackEntry) {
-                return this.createPriceResponse(originalSKU, fallbackEntry, parsedSKU);
-            }
-        }
-
-        return {
-            sku: originalSKU,
-            source: 'bptf',
-            time: Math.floor(Date.now() / 1000),
-            buy: null,
-            sell: null
-        };
-    }
-
-    private createPriceResponse(
-        sku: string,
-        priceEntry: BackpackTFPriceEntry,
-        parsed: ReturnType<typeof SKU.fromString>
-    ): GetItemPriceResponse {
+    private createPriceResponse(sku: string, priceEntry: PriceEntry, parsed: any): GetItemPriceResponse {
         const currency = priceEntry.currency;
         const buyValue = priceEntry.value_raw ?? priceEntry.value;
         const valueHigh = priceEntry.value_high ?? null;
 
-        const buy = this.toCurrencies(buyValue, currency);
+        const buy = this.createCurrencies(buyValue, currency);
         const sellValue = this.calculateSellPrice(buyValue, currency, valueHigh, parsed);
-        const sell = this.toCurrencies(sellValue, currency);
+        const sell = this.createCurrencies(sellValue, currency);
 
         return {
             sku,
@@ -406,45 +253,14 @@ export default class BackpackTFPricer implements IPricer {
         };
     }
 
-    private async handleUnusualPrice(
-        sku: string,
-        parsed: ReturnType<typeof SKU.fromString>,
-        data: BackpackTFResponse
-    ): Promise<GetItemPriceResponse> {
-        for (const name in data.response.items) {
-            const item = data.response.items[name];
-            const defindexes = item.defindex || [];
-
-            if (!defindexes.includes(Number(parsed.defindex))) continue;
-
-            const qualities = item.prices;
-            const qualityData = qualities['5'];
-
-            if (!qualityData) continue;
-
-            const tradable = parsed.tradable ? 'Tradable' : 'Non-Tradable';
-            const craftable = parsed.craftable ? 'Craftable' : 'Non-Craftable';
-
-            const baseStructure = qualityData?.[tradable]?.[craftable];
-            if (!baseStructure) continue;
-
-            if (parsed.effect && baseStructure[parsed.effect]) {
-                const effectPrices = baseStructure[parsed.effect];
-                const priceEntry = Array.isArray(effectPrices) ? effectPrices[0] : effectPrices;
-
-                if (priceEntry && typeof priceEntry === 'object' && 'currency' in priceEntry) {
-                    return this.createPriceResponse(sku, priceEntry as BackpackTFPriceEntry, parsed);
-                }
-            }
-        }
-
+    private createErrorResponse(sku: string, message: string): GetItemPriceResponse {
         return {
             sku,
             source: 'bptf',
             time: Math.floor(Date.now() / 1000),
             buy: null,
             sell: null,
-            message: 'Unusual effect not found in price data'
+            message
         };
     }
 
@@ -454,40 +270,8 @@ export default class BackpackTFPricer implements IPricer {
             const items: Item[] = [];
             const processedSKUs = new Set<string>();
 
-            for (const name in data.response.items) {
-                const item = data.response.items[name];
-                const defindexes = item.defindex || [];
-
-                for (const defindex of defindexes) {
-                    const qualities = item.prices;
-
-                    for (const qualityId in qualities) {
-                        const qualityPrices = qualities[qualityId];
-
-                        for (const tradableKey of ['Tradable', 'Non-Tradable']) {
-                            const tradableData = qualityPrices[tradableKey];
-                            if (!tradableData) continue;
-
-                            for (const craftableKey of ['Craftable', 'Non-Craftable']) {
-                                const craftableData = tradableData[craftableKey];
-                                if (!craftableData) continue;
-
-                                this.processNestedPrices(
-                                    craftableData,
-                                    {
-                                        defindex: Number(defindex),
-                                        quality: Number(qualityId),
-                                        tradable: tradableKey === 'Tradable',
-                                        craftable: craftableKey === 'Craftable'
-                                    },
-                                    items,
-                                    processedSKUs,
-                                    data.response.current_time
-                                );
-                            }
-                        }
-                    }
-                }
+            for (const [itemName, itemData] of Object.entries(data.response.items)) {
+                this.processItemData(itemData, items, processedSKUs, data.response.current_time);
             }
 
             console.log(`Loaded ${items.length} items from Backpack.tf`);
@@ -498,73 +282,119 @@ export default class BackpackTFPricer implements IPricer {
         }
     }
 
-    private processNestedPrices(
+    private processItemData(itemData: ItemData, items: Item[], processedSKUs: Set<string>, currentTime: number): void {
+        for (const defindex of itemData.defindex) {
+            this.processQualityData(itemData.prices, defindex, items, processedSKUs, currentTime);
+        }
+    }
+
+    private processQualityData(
+        qualityData: Record<string, any>,
+        defindex: number,
+        items: Item[],
+        processedSKUs: Set<string>,
+        currentTime: number
+    ): void {
+        for (const [qualityId, tradableData] of Object.entries(qualityData)) {
+            const quality = parseInt(qualityId);
+
+            for (const [tradableKey, craftableData] of Object.entries(tradableData)) {
+                const tradable = tradableKey === 'Tradable';
+
+                for (const [craftableKey, priceData] of Object.entries(craftableData)) {
+                    const craftable = craftableKey === 'Craftable';
+
+                    this.extractPricesRecursively(
+                        priceData,
+                        { defindex, quality, tradable, craftable },
+                        items,
+                        processedSKUs,
+                        currentTime
+                    );
+                }
+            }
+        }
+    }
+
+    private extractPricesRecursively(
         data: any,
         baseSKU: any,
         items: Item[],
         processedSKUs: Set<string>,
         currentTime: number,
-        depth = 0,
-        attributes: any = {}
+        attributes: any = {},
+        depth = 0
     ): void {
-        if (depth > 10) return;
+        if (depth > 6) return;
 
-        if (Array.isArray(data) && data.length > 0) {
-            const priceEntry = data[0];
-            if (priceEntry && typeof priceEntry === 'object' && 'currency' in priceEntry) {
-                this.addItemToList(
-                    baseSKU,
-                    attributes,
-                    priceEntry as BackpackTFPriceEntry,
-                    items,
-                    processedSKUs,
-                    currentTime
-                );
-            }
+        if (Array.isArray(data) && data.length > 0 && this.isPriceEntry(data[0])) {
+            this.addItemToList(baseSKU, attributes, data[0], items, processedSKUs, currentTime);
             return;
         }
 
         if (typeof data === 'object' && data !== null) {
-            for (const key in data) {
-                const value = data[key];
-
-                const newAttributes = { ...attributes };
-
-                if (['Normal', 'Killstreak', 'Specialized Killstreak', 'Professional Killstreak'].includes(key)) {
-                    const killstreakMap: { [key: string]: number } = {
-                        Normal: 0,
-                        Killstreak: 1,
-                        'Specialized Killstreak': 2,
-                        'Professional Killstreak': 3
-                    };
-                    newAttributes.killstreak = killstreakMap[key];
-                } else if (key === 'Strange') {
-                    newAttributes.quality2 = 11;
-                } else if (key === 'Australium') {
-                    newAttributes.australium = true;
-                } else if (key === 'Festive') {
-                    newAttributes.festive = true;
-                } else if (!isNaN(Number(key)) && baseSKU.quality === 5) {
-                    newAttributes.effect = Number(key);
-                }
-
-                this.processNestedPrices(value, baseSKU, items, processedSKUs, currentTime, depth + 1, newAttributes);
+            for (const [key, value] of Object.entries(data)) {
+                const newAttributes = this.parseAttributeKey(key, attributes);
+                this.extractPricesRecursively(
+                    value,
+                    baseSKU,
+                    items,
+                    processedSKUs,
+                    currentTime,
+                    newAttributes,
+                    depth + 1
+                );
             }
         }
+    }
+
+    private parseAttributeKey(key: string, currentAttributes: any): any {
+        const newAttributes = { ...currentAttributes };
+
+        switch (key) {
+            case 'Killstreak':
+                newAttributes.killstreak = 1;
+                break;
+            case 'Specialized Killstreak':
+                newAttributes.killstreak = 2;
+                break;
+            case 'Professional Killstreak':
+                newAttributes.killstreak = 3;
+                break;
+            case 'Strange':
+                newAttributes.quality2 = 11;
+                break;
+            case 'Australium':
+                newAttributes.australium = true;
+                break;
+            case 'Festive':
+                newAttributes.festive = true;
+                break;
+            default:
+                const numKey = parseInt(key);
+                if (!isNaN(numKey) && currentAttributes.quality === 5) {
+                    newAttributes.effect = numKey;
+                }
+        }
+
+        return newAttributes;
+    }
+
+    private isPriceEntry(obj: any): obj is PriceEntry {
+        return obj && typeof obj === 'object' && 'currency' in obj && 'value' in obj;
     }
 
     private addItemToList(
         baseSKU: any,
         attributes: any,
-        priceEntry: BackpackTFPriceEntry,
+        priceEntry: PriceEntry,
         items: Item[],
         processedSKUs: Set<string>,
         currentTime: number
     ): void {
         try {
             const fullSKU = { ...baseSKU, ...attributes };
-            const sku = SKU.fromObject(fullSKU);
-            const skuString = sku.toString();
+            const skuString = SKU.fromObject(fullSKU).toString();
 
             if (processedSKUs.has(skuString)) return;
             processedSKUs.add(skuString);
@@ -573,9 +403,9 @@ export default class BackpackTFPricer implements IPricer {
             const buyValue = priceEntry.value_raw ?? priceEntry.value;
             const valueHigh = priceEntry.value_high ?? null;
 
-            const buy = this.toCurrencies(buyValue, currency);
+            const buy = this.createCurrencies(buyValue, currency);
             const sellValue = this.calculateSellPrice(buyValue, currency, valueHigh, fullSKU);
-            const sell = this.toCurrencies(sellValue, currency);
+            const sell = this.createCurrencies(sellValue, currency);
 
             items.push({
                 sku: skuString,
@@ -584,26 +414,23 @@ export default class BackpackTFPricer implements IPricer {
                 buy,
                 sell
             });
-        } catch (error) {
-            console.debug('Skipping invalid SKU combination:', baseSKU, attributes, error);
-        }
+        } catch (error) {}
     }
 
     public clearCache(): void {
-        this.pricesCache = null;
-        this.cacheTime = 0;
+        this.cache = null;
     }
 
     public getCacheInfo(): { cached: boolean; age: number; expires: number } {
-        const now = Date.now();
-        const age = now - this.cacheTime;
-        const expires = this.cacheTimeout - age;
+        if (!this.cache) {
+            return { cached: false, age: 0, expires: 0 };
+        }
 
-        return {
-            cached: this.pricesCache !== null,
-            age,
-            expires: Math.max(0, expires)
-        };
+        const now = Date.now();
+        const age = now - this.cache.timestamp;
+        const expires = Math.max(0, this.cacheTimeout - age);
+
+        return { cached: true, age, expires };
     }
 
     public async checkApiHealth(): Promise<{ success: boolean; responseTime: number; error?: string }> {
@@ -628,87 +455,16 @@ export default class BackpackTFPricer implements IPricer {
         }
     }
 
-    public async getPriceStats(): Promise<{
-        totalItems: number;
-        byQuality: { [quality: string]: number };
-        byType: {
-            normal: number;
-            killstreak: number;
-            strange: number;
-            australium: number;
-            festive: number;
-            unusual: number;
-        };
-        lastUpdate: number;
-    }> {
-        try {
-            const data = await this.fetchPrices();
-            let totalItems = 0;
-            const byQuality: { [quality: string]: number } = {};
-            const byType = {
-                normal: 0,
-                killstreak: 0,
-                strange: 0,
-                australium: 0,
-                festive: 0,
-                unusual: 0
-            };
-
-            for (const name in data.response.items) {
-                const item = data.response.items[name];
-                const qualities = item.prices;
-
-                for (const qualityId in qualities) {
-                    byQuality[qualityId] = (byQuality[qualityId] || 0) + 1;
-                    totalItems++;
-
-                    if (qualityId === '5') byType.unusual++;
-
-                    const qualityData = qualities[qualityId];
-                    this.countItemTypes(qualityData, byType);
-                }
-            }
-
-            return {
-                totalItems,
-                byQuality,
-                byType,
-                lastUpdate: data.response.current_time
-            };
-        } catch (error) {
-            throw new Error(`Failed to get price stats: ${error instanceof Error ? error.message : 'Unknown error'}`);
-        }
-    }
-
-    private countItemTypes(data: any, byType: any, depth = 0): void {
-        if (depth > 10) return;
-
-        if (typeof data === 'object' && data !== null) {
-            for (const key in data) {
-                if (key.includes('Killstreak')) byType.killstreak++;
-                if (key === 'Strange') byType.strange++;
-                if (key === 'Australium') byType.australium++;
-                if (key === 'Festive') byType.festive++;
-                if (key === 'Normal') byType.normal++;
-
-                if (typeof data[key] === 'object') {
-                    this.countItemTypes(data[key], byType, depth + 1);
-                }
-            }
-        }
-    }
-
     get isPricerConnecting(): boolean {
         return false;
     }
 
     connect(_enabled: boolean): void {
-        console.log('BackpackTF Pricer connected');
+        //
     }
 
-    init(_enabled: boolean): void {
-        console.log('BackpackTF Pricer initialized');
-        if (_enabled) {
+    init(enabled: boolean): void {
+        if (enabled) {
             this.fetchPrices().catch(error => {
                 console.error('Failed to preload price cache:', error);
             });
@@ -716,11 +472,10 @@ export default class BackpackTFPricer implements IPricer {
     }
 
     shutdown(_enabled: boolean): void {
-        console.log('BackpackTF Pricer shutdown');
         this.clearCache();
     }
 
     bindHandlePriceEvent(_fn: (item: GetItemPriceResponse) => void): void {
-        console.log('Price event binding not supported for BackpackTF API');
+        ////
     }
 }
